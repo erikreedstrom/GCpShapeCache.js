@@ -38,7 +38,7 @@ var gcp = gcp || {};
 gcp._pointFromString = function(str)
 {
     var coords = str.replace(/[{}]/g, "").trim().split(",");
-    return new cc.Point(parseFloat(coords[0]),parseFloat(coords[1]));
+    return cp.v(parseFloat(coords[0]),parseFloat(coords[1]));
 };
 
 /**
@@ -53,7 +53,7 @@ gcp.ShapeCache = cc.Class.extend({
      * Constructor
      */
     ctor:function () {
-        this.bodyDefs = [];
+        this.bodyDefs = {};
     },
 
     /**
@@ -62,14 +62,29 @@ gcp.ShapeCache = cc.Class.extend({
      * @result false in case of error
      */
     addShapesWithFile: function (plist) {
-        var dictionary = cc.FileUtils.getInstance().dictionaryWithContentsOfFileThreadSafe(plist);
-        if(!dictionary) return false;
+        //in html5
+        cc.loader.loadTxt(plist, function (err, txt) {
+            try{
+                if (!err) {
+                    var dictionary = cc.plistParser.parse(txt);
+                    this.processData(dictionary);
+                }
+            }catch(e){
+                throw e;
+            }
+        }.bind(this));
+        //in jsb
+//        var dictionary = cc.plistParser.parse(plist);
+//        this.processData(dictionary);
+    },
 
+    processData: function (dictionary) {
+        cc.assert(dictionary, "");
 
         var metadataDict = dictionary["metadata"];
         var format = parseInt(metadataDict["format"]);
 
-        cc.Assert(format == 1, "Format not supported");
+        cc.assert(format == 1, "Format not supported");
         if(format != 1) return false;
 
         var bodyDict = dictionary["bodies"];
@@ -112,9 +127,16 @@ gcp.ShapeCache = cc.Class.extend({
                 fd.layers = parseInt(fixtureData["layers"]);
                 fd.group = parseInt(fixtureData["group"]);
                 fd.collisionType = parseInt(fixtureData["collision_type"]);
-                fd.isSensor = fixtureData["fixtureData"] === "true";
+                fd.isSensor = fixtureData["isSensor"] === true;
 
-                var fixtureType = fixtureData["fixture_type"];
+//                var fixtureType = fixtureData["fixture_type"];
+                var circleObject = fixtureData["circle"];
+                var polygonsArray = fixtureData["polygons"];
+                if (circleObject) {
+                    fd.fixtureType = "CIRCLE";
+                } else if (polygonsArray) {
+                    fd.fixtureType = "POLYGON";
+                }
 
                 var totalArea = 0.0;
 
@@ -122,10 +144,8 @@ gcp.ShapeCache = cc.Class.extend({
                 totalMass += fd.mass;
 
                 // read polygon fixtures. One concave fixture may consist of several convex polygons
-                if(fixtureType === "POLYGON")
+                if(fd.fixtureType === "POLYGON")
                 {
-                    var polygonsArray = fixtureData["polygons"];
-
                     for(var polygonIndex in polygonsArray)
                     {
                         var polygonArray = polygonsArray[polygonIndex];
@@ -150,7 +170,7 @@ gcp.ShapeCache = cc.Class.extend({
                             var offset = gcp._pointFromString(pointString);
                             vertices[vindex] = offset.x;
                             vertices[vindex+1] = offset.y;
-                            tempVerts.push(new cp.Vect(offset.x,offset.y));
+                            tempVerts.push(cp.v(offset.x,offset.y));
                             vindex+= 2;
                         }
 
@@ -161,10 +181,16 @@ gcp.ShapeCache = cc.Class.extend({
                         totalArea += poly.area;
                     }
                 }
+                else if (fd.fixtureType === "CIRCLE")
+                {
+                    fd.radius = parseFloat(circleObject["radius"]);
+                    fd.center = gcp._pointFromString(circleObject["position"]);
+                    totalArea += 3.1415927 * fd.radius * fd.radius;
+                }
                 else
                 {
-                    // circles are not yet supported
-                    cc.Assert(0)
+                    // unknown type
+                    cc.assert(0, "")
                 }
 
                 fd.area = totalArea;
@@ -174,18 +200,25 @@ gcp.ShapeCache = cc.Class.extend({
 
                 if(totalArea)
                 {
-                    for(var pIndex in fd.polygons)
+                    if (fd.fixtureType === "CIRCLE")
                     {
-                        var p = fd.polygons[pIndex];
+                        totalFixtureMomentum += cp.momentForCircle(fd.mass, 0/*fd.radius*/, fd.radius, fd.center);
+                    }
+                    else if (fd.fixtureType === "POLYGON")
+                    {
+                        for(var pIndex in fd.polygons)
+                        {
+                            var p = fd.polygons[pIndex];
 
-                        // update mass
-                        p.mass = (p.area * fd.mass) / fd.area;
+                            // update mass
+                            p.mass = (p.area * fd.mass) / fd.area;
 
-                        // calculate momentum
-                        p.momentum = cp.momentForPoly(p.mass, p.vertices, new cc.Point(0,0));
+                            // calculate momentum
+                            p.momentum = cp.momentForPoly(p.mass, p.vertices, cp.v(0, 0));
 
-                        // calculate total momentum
-                        totalFixtureMomentum += p.momentum;
+                            // calculate total momentum
+                            totalFixtureMomentum += p.momentum;
+                        }
                     }
                 }
                 fd.momentum = totalFixtureMomentum;
@@ -196,8 +229,6 @@ gcp.ShapeCache = cc.Class.extend({
             bodyDef.mass = totalMass;
             bodyDef.momentum = totalBodyMomentum;
         }
-
-        return true;
     },
 
     /**
@@ -209,7 +240,7 @@ gcp.ShapeCache = cc.Class.extend({
      */
     createBodyWithName: function (name, space, data) {
         var bd = this.bodyDefs[name];
-        cc.Assert(bd != 0, "Body not found");
+        cc.assert(bd != 0, "Body not found");
         if(!bd) return 0;
 
         // create and add body to space
@@ -228,14 +259,11 @@ gcp.ShapeCache = cc.Class.extend({
         for(var fdIndex in bd.fixtures)
         {
             var fd = bd.fixtures[fdIndex];
-
-            // iterate over polygons
-            for(var pIndex in fd.polygons)
+            var shape;
+            if (fd.fixtureType === "CIRCLE")
             {
-                var p = fd.polygons[pIndex];
-
-                // create new shape
-                var shape = new cp.PolyShape(body, p.vertices, new cc.Point(0,0));
+                //create new shape
+                shape = new cp.CircleShape(body, fd.radius, fd.center);
 
                 // set values
                 shape.e = fd.elasticity;
@@ -249,8 +277,30 @@ gcp.ShapeCache = cc.Class.extend({
                 // add shape to space
                 space.addShape(shape);
             }
-        }
+            else if (fd.fixtureType === "POLYGON")
+            {
+                // iterate over polygons
+                for(var pIndex in fd.polygons)
+                {
+                    var p = fd.polygons[pIndex];
 
+                    // create new shape
+                    shape = new cp.PolyShape(body, p.vertices, cp.v(0,0));
+
+                    // set values
+                    shape.e = fd.elasticity;
+                    shape.u = fd.friction;
+                    shape.surface_v = fd.surfaceVelocity;
+                    shape.collision_type = fd.collisionType;
+                    shape.group = fd.group;
+                    shape.layers = fd.layers;
+                    shape.sensor = fd.isSensor;
+
+                    // add shape to space
+                    space.addShape(shape);
+                }
+            }
+        }
         return body;
     },
 
@@ -261,7 +311,7 @@ gcp.ShapeCache = cc.Class.extend({
      */
     anchorPointForShape: function (shape) {
         var bd = this.bodyDefs[shape];
-        cc.Assert(bd);
+        cc.assert(bd, "");
         return bd.anchorPoint;
     }
 
@@ -303,6 +353,7 @@ g.Polygon = cc.Class.extend({
  * Holds fixture data
  */
 g.FixtureData = cc.Class.extend({
+    fixtureType:null,
     mass:0.0,
     elasticity:0.0,
     friction:0.0,
@@ -313,7 +364,15 @@ g.FixtureData = cc.Class.extend({
     area:0.0,
     momentum:0.0,
     isSensor:false,
-    polygons:[]
+    //for circle
+    radius:0.0,
+    center:null,
+    //for polygons
+    polygons:null,
+
+    ctor:function(){
+        this.polygons = [];
+    }
 });
 
 /**
@@ -322,7 +381,11 @@ g.FixtureData = cc.Class.extend({
  */
 g.BodyDef = cc.Class.extend({
     anchorPoint:null,
-    fixtures:[],
+    fixtures:null,
     mass:0.0,
-    momentum:0.0
+    momentum:0.0,
+
+    ctor:function(){
+        this.fixtures = [];
+    }
 });
